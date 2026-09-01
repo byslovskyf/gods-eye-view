@@ -830,6 +830,122 @@ test('tuner drag keeps one immutable catalog resolution through refresh and rele
   }
 });
 
+test('hiding the Radio layer keeps the stream on air; destroy still ends it', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAudio = globalThis.Audio;
+  const audioInstances = [];
+  const stationRows = [{
+    id: '00000000-0000-4000-8000-000000000081',
+    name: 'Background broadcaster',
+    lat: 30,
+    lon: -97,
+    streamUrl: 'https://radio.example.com/background.mp3',
+    homepage: null,
+    tags: ['news'],
+    languages: ['English'],
+    state: 'Texas',
+    country: 'United States',
+    countryCode: 'US',
+    metadataTrust: 'untrusted-community',
+    codec: 'MP3',
+    bitrate: 128,
+  }];
+  globalThis.Audio = class FakeAudio {
+    constructor() {
+      this.volume = 0.8;
+      this.src = '';
+      this.paused = false;
+      this.srcRemoved = false;
+      this.listeners = new Map();
+      audioInstances.push(this);
+    }
+
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    pause() { this.paused = true; }
+    play() { this.paused = false; return Promise.resolve(); }
+    removeAttribute(name) { if (name === 'src') { this.src = ''; this.srcRemoved = true; } }
+    load() {}
+  };
+  globalThis.fetch = async (url) => (String(url).startsWith('/api/radio/click/')
+    ? { ok: true }
+    : new Response(JSON.stringify({
+      stations: stationRows,
+      stale: false,
+      degraded: false,
+      acceptedGeneration: 1,
+      catalogInstance: 'qa-instance-background',
+      updatedAt: new Date().toISOString(),
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+  const viewer = {
+    camera: { positionWC: { x: 7_000_000, y: 0, z: 0 } },
+    scene: { canvas: { disableRootEvents: true, onwheel: null, addEventListener() {}, removeEventListener() {} } },
+    dataSources: { add() {}, remove() {} },
+    entities: { add(entity) { return entity; }, remove() {} },
+  };
+
+  radioLayer.destroy();
+  try {
+    radioLayer.init(viewer);
+    radioLayer.enable();
+    radioLayer.setLifecyclePresentation({
+      lifecycleState: 'enabled', enabled: true, uncertain: false,
+    });
+    await radioLayer.update();
+    assert.equal(radioLayer.selectStation(stationRows[0].id, { autoplay: false, focus: false }), true);
+    assert.equal(await radioLayer.play({ origin: 'user' }), true);
+    await new Promise((resolve) => setTimeout(resolve));
+    const onAir = audioInstances.at(-1);
+    onAir.listeners.get('playing')?.();
+    assert.equal(radioLayer.getUIState().audioState, 'playing');
+
+    // Hiding the layer is a request to stop DRAWING, never a request for silence.
+    radioLayer.disable();
+    const hidden = radioLayer.getUIState();
+    assert.equal(hidden.enabled, false, 'the layer is hidden');
+    assert.equal(hidden.audioState, 'playing', 'the stream survives the layer toggle');
+    assert.equal(hidden.playingStationId, stationRows[0].id);
+    assert.equal(hidden.backgroundPlayback, true, 'the UI can keep a live transport');
+    assert.equal(onAir.paused, false, 'the element was never paused');
+    assert.equal(onAir.srcRemoved, false, 'the stream resource was never released');
+
+    // The transport still owns a hidden stream: pause, resume, level and stop.
+    assert.equal(await radioLayer.togglePlayback({ origin: 'user' }), true);
+    assert.equal(radioLayer.getUIState().audioState, 'paused');
+    assert.equal(setRadioVolume(0.3), true, 'a hidden stream is still levellable');
+    assert.equal(radioLayer.getUIState().volume, 0.3);
+    assert.equal(await radioLayer.togglePlayback({ origin: 'user' }), true, 'hidden resume');
+    assert.equal(radioLayer.stopPlayback({ origin: 'user' }), true);
+    assert.equal(radioLayer.getUIState().audioState, 'stopped');
+    assert.equal(
+      radioLayer.getUIState().backgroundPlayback,
+      false,
+      'a stopped hidden layer has no transport left to keep alive',
+    );
+
+    // A hidden layer may resume what is already tuned but never start fresh.
+    assert.equal(await radioLayer.togglePlayback({ origin: 'user' }), false);
+
+    // Teardown must end the stream itself now that disable() no longer does.
+    assert.equal(await radioLayer.play({ origin: 'user' }), false, 'hidden cold start refused');
+    radioLayer.enable();
+    radioLayer.setLifecyclePresentation({
+      lifecycleState: 'enabled', enabled: true, uncertain: false,
+    });
+    assert.equal(await radioLayer.play({ origin: 'user' }), true);
+    const live = audioInstances.at(-1);
+    radioLayer.disable();
+    assert.equal(live.paused, false, 'still broadcasting while hidden');
+    radioLayer.destroy();
+    assert.equal(live.paused, true, 'destroy pauses the element it is about to drop');
+    assert.equal(live.srcRemoved, true, 'destroy releases the stream resource');
+  } finally {
+    globalThis.fetch = originalFetch;
+    radioLayer.destroy();
+    if (originalAudio === undefined) delete globalThis.Audio;
+    else globalThis.Audio = originalAudio;
+  }
+});
+
 test('failed exact tuner release cannot consume a stale playback fallback', async () => {
   const originalFetch = globalThis.fetch;
   const originalAudio = globalThis.Audio;

@@ -1227,6 +1227,9 @@ export function getRadioUIState() {
     pinnedStationIds: Object.freeze([..._pinnedById.keys()]),
     acceptedCatalogGeneration: _acceptedCatalogSnapshot.generation,
     presentationActive: radioPresentationAllowed(),
+    // Still on air with the layer hidden — the UI keeps the transport live for
+    // this so a background stream is never stranded without a stop button.
+    backgroundPlayback: radioBackgroundPlaybackActive(),
     stationCount: _stations.length,
     filteredCount: visible.length,
     selected,
@@ -1774,7 +1777,10 @@ function recordDirectoryClick(id) {
 /** Play the selected broadcaster stream after an explicit user action. */
 export async function playSelectedRadio({ origin = 'programmatic', attemptId = null } = {}) {
   const station = selectedStation();
-  if (!radioPresentationAllowed() || !station?.streamUrl) return false;
+  if (!station?.streamUrl) return false;
+  // Resuming the station already on air is allowed while the layer is hidden;
+  // starting a fresh one is not (see radioBackgroundPlaybackActive).
+  if (!radioPresentationAllowed() && !radioBackgroundPlaybackActive()) return false;
   if (_tuningActive) endRadioTuning();
   // A media event carries no reliable attempt identity. Give every explicit
   // play/resume/replacement its own element so queued events from the retired
@@ -1928,7 +1934,7 @@ export function toggleRadioPlayback({ origin = 'programmatic' } = {}) {
   if (['loading', 'playing', 'buffering'].includes(_audioState)) {
     return Promise.resolve(pauseRadioPlayback({ origin }));
   }
-  if (!radioPresentationAllowed()) return Promise.resolve(false);
+  if (!radioPresentationAllowed() && !radioBackgroundPlaybackActive()) return Promise.resolve(false);
   if (!_selectedId) {
     const ranked = rankedVisibleStations();
     if (!ranked.length) return Promise.resolve(false);
@@ -1961,7 +1967,7 @@ export function pauseRadioPlayback({ origin = 'programmatic' } = {}) {
 
 /** Set shared audio volume, clamped to [0, 1]. */
 export function setRadioVolume(value) {
-  if (!radioPresentationAllowed()) return false;
+  if (!radioPresentationAllowed() && !radioBackgroundPlaybackActive()) return false;
   const volume = clampRadioVolume(value);
   _userVolume = volume;
   installAudio();
@@ -2587,6 +2593,22 @@ function radioPresentationAllowed() {
     && !_managerLifecyclePresentation.uncertain;
 }
 
+/**
+ * True when a stream the user tuned is still alive while the layer is hidden.
+ *
+ * Hiding Radio drops its map presence — markers, picking, camera flights, the
+ * tuner — but must not silence audio the user deliberately started: the
+ * transport owns the stream's lifetime, not the layer toggle. Every surface
+ * that needs a VISIBLE station (picking one from the viewport, driving the
+ * tuner band, flying the camera) keeps gating on radioPresentationAllowed()
+ * alone; only the surfaces that act on the ALREADY-TUNED station also accept
+ * this state, so a hidden layer can be paused, resumed, re-levelled and
+ * stopped, but can never start a brand-new stream it cannot show.
+ */
+function radioBackgroundPlaybackActive() {
+  return !radioPresentationAllowed() && Boolean(_audioStationId);
+}
+
 function syncRadioLifecyclePresentation() {
   const visible = radioPresentationAllowed();
   if (_dataSource) _dataSource.show = visible;
@@ -2678,7 +2700,14 @@ export const radioLayer = {
     emitState();
   },
 
-  /** Hide the layer and stop playback without forgetting the selected station. */
+  /**
+   * Hide the layer, keeping both the selected station AND any live stream.
+   *
+   * Turning Radio off is a REQUEST TO STOP DRAWING, not a request for silence:
+   * the user hides the station markers to clear the globe while the broadcast
+   * keeps playing. Audio therefore survives this call and is ended only by the
+   * transport (stop/pause) or by tearing the layer down in remove().
+   */
   disable() {
     _sessionGeneration += 1;
     _enabled = false;
@@ -2694,7 +2723,9 @@ export const radioLayer = {
     endRadioTuning();
     _cancelledTuningPresentationStation = null;
     _tuningUnavailableStationId = null;
-    stopRadioPlayback({ origin: 'layer-disable' });
+    // Deliberately NOT stopRadioPlayback(): a hidden layer keeps broadcasting.
+    // endRadioTuning() above already silenced the tuner's static, which is a
+    // presentation effect, not the stream.
     if (_dataSource) _dataSource.show = false;
     if (_selectedEntity && _viewer) _viewer.entities.remove(_selectedEntity);
     _selectedEntity = null;
@@ -2831,6 +2862,11 @@ export const radioLayer = {
   /** Release rendering, event, request, and playback resources. */
   destroy() {
     this.disable();
+    // disable() deliberately leaves a hidden layer broadcasting, so teardown
+    // has to end the stream itself: _audio is dropped a few lines below, and
+    // without this the element would keep pulling the stream with no handle
+    // left to stop it.
+    stopRadioPlayback({ origin: 'layer-destroy' });
     cancelRadioVolumeTransition();
     _voiceDucked = false;
     _voiceRestoring = false;
